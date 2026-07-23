@@ -11,7 +11,24 @@ from plotly import express as px
 from plotly import graph_objects as go
 
 INITIAL_EQUITY = 100000.0
+TRADING_DAYS_PER_YEAR = 252
 EPSILON = 1e-9
+
+DEAL_COLUMNS = [
+    "Time",
+    "Deal",
+    "Position",
+    "Order",
+    "Symbol",
+    "Type",
+    "Direction",
+    "Volume",
+    "Profit",
+    "Commission",
+    "Fee",
+    "Swap",
+    "NetPnl",
+]
 
 
 SUMMARY_KEYS = {
@@ -87,6 +104,14 @@ def to_float(value: Any) -> float | None:
         return float(text)
     except ValueError:
         return None
+
+
+def to_identifier(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip() or None
 
 
 def find_best_value_in_row(row: tuple[Any, ...], label_index: int) -> Any:
@@ -205,6 +230,12 @@ def extract_deals_dataframe(ws) -> pd.DataFrame:
         row_fee = ws.cell(r, header_map["fee"]).value if "fee" in header_map else 0.0
         row_swap = ws.cell(r, header_map["swap"]).value if "swap" in header_map else 0.0
         row_deal = ws.cell(r, header_map["deal"]).value if "deal" in header_map else None
+        row_position = (
+            ws.cell(r, header_map["position"]).value if "position" in header_map else None
+        )
+        row_order = ws.cell(r, header_map["order"]).value if "order" in header_map else None
+        row_symbol = ws.cell(r, header_map["symbol"]).value if "symbol" in header_map else None
+        row_volume = ws.cell(r, header_map["volume"]).value if "volume" in header_map else 0.0
 
         row_time_parsed = pd.to_datetime(row_time, errors="coerce")
         if pd.isna(row_time_parsed):
@@ -213,7 +244,7 @@ def extract_deals_dataframe(ws) -> pd.DataFrame:
 
         # Ignore rows from subsequent non-deal sections (Open positions/orders)
         # that can appear after the Deals section in some report exports.
-        if row_deal is None or not isinstance(row_deal, (int, float)):
+        if to_identifier(row_deal) is None:
             r += 1
             continue
 
@@ -232,8 +263,13 @@ def extract_deals_dataframe(ws) -> pd.DataFrame:
         rows.append(
             {
                 "Time": row_time_parsed,
+                "Deal": to_identifier(row_deal),
+                "Position": to_identifier(row_position),
+                "Order": to_identifier(row_order),
+                "Symbol": str(row_symbol).strip() if row_symbol not in (None, "") else None,
                 "Type": row_type_norm,
                 "Direction": direction_norm,
+                "Volume": to_float(row_volume) or 0.0,
                 "Profit": profit_value,
                 "Commission": commission_value,
                 "Fee": fee_value,
@@ -243,27 +279,110 @@ def extract_deals_dataframe(ws) -> pd.DataFrame:
         )
         r += 1
 
-    deals = pd.DataFrame(rows)
+    if not rows:
+        return pd.DataFrame(columns=DEAL_COLUMNS)
+
+    deals = pd.DataFrame(rows, columns=DEAL_COLUMNS)
     deals = deals.dropna(subset=["Time"]).sort_values("Time").reset_index(drop=True)
     return deals
 
 
 def extract_realized_deals(deals: pd.DataFrame) -> pd.DataFrame:
+    """Return one fully netted result per completed position/trade.
+
+    MetaTrader's Deals section contains execution cash flows, not one row per
+    trade. Entry commissions therefore must not be counted as separate losing
+    trades. When position identifiers are available, all executions belonging
+    to a closed position are grouped. Otherwise, closing executions form the
+    trades and unmatched entry costs are allocated by closing volume so that
+    trade P&L reconciles exactly to total trading cash flow.
+    """
     if deals.empty:
-        return pd.DataFrame(columns=["Time", "Type", "Direction", "Profit"])
+        return pd.DataFrame(columns=["Time", "NetPnl", "Volume", "Position"])
 
     closing_directions = {"out", "inout", "out by"}
     non_trade_types = {"balance", "credit"}
-
-    realized = deals[
+    cashflows = deals[
         (~deals["Type"].isin(non_trade_types))
-        & (
-            deals["Direction"].isin(closing_directions)
-            | (deals["NetPnl"].abs() > EPSILON)
-        )
+        & deals["Direction"].isin({"in", *closing_directions})
     ].copy()
+    if cashflows.empty:
+        return pd.DataFrame(columns=["Time", "NetPnl", "Volume", "Position"])
 
-    return realized.sort_values("Time").reset_index(drop=True)
+    closing = cashflows[cashflows["Direction"].isin(closing_directions)].copy()
+    if closing.empty:
+        return pd.DataFrame(columns=["Time", "NetPnl", "Volume", "Position"])
+
+    rows: list[dict[str, Any]] = []
+    used_indexes: set[int] = set()
+    has_positions = (
+        "Position" in cashflows.columns
+        and closing["Position"].notna().any()
+    )
+
+    if has_positions:
+        for position, closing_group in closing.dropna(subset=["Position"]).groupby(
+            "Position", sort=False
+        ):
+            position_rows = cashflows[cashflows["Position"] == position]
+            used_indexes.update(position_rows.index.tolist())
+            rows.append(
+                {
+                    "Time": closing_group["Time"].max(),
+                    "NetPnl": float(position_rows["NetPnl"].sum()),
+                    "Volume": float(closing_group["Volume"].abs().sum()),
+                    "Position": position,
+                }
+            )
+
+    remaining_closes = closing[~closing.index.isin(used_indexes)]
+    for idx, row in remaining_closes.iterrows():
+        used_indexes.add(idx)
+        rows.append(
+            {
+                "Time": row["Time"],
+                "NetPnl": float(row["NetPnl"]),
+                "Volume": abs(float(row.get("Volume", 0.0))),
+                "Position": row.get("Position"),
+            }
+        )
+
+    realized = pd.DataFrame(rows).sort_values("Time").reset_index(drop=True)
+
+    # Entry fees may not carry a position ID in some exports. Reconcile any
+    # remaining trading cash flow to completed trades without inventing trades.
+    unmatched_pnl = float(cashflows.loc[~cashflows.index.isin(used_indexes), "NetPnl"].sum())
+    if abs(unmatched_pnl) > EPSILON and not realized.empty:
+        weights = realized["Volume"].abs().astype(float)
+        if float(weights.sum()) <= EPSILON:
+            weights = pd.Series(1.0, index=realized.index)
+        realized["NetPnl"] += unmatched_pnl * (weights / float(weights.sum()))
+
+    return realized
+
+
+def build_daily_returns(realized_deals: pd.DataFrame) -> pd.DataFrame:
+    """Build fixed-balance daily returns, including zero-P&L business days."""
+    if realized_deals.empty:
+        return pd.DataFrame(columns=["Date", "NetPnl", "Return"])
+
+    daily_pnl = (
+        realized_deals.assign(Date=pd.to_datetime(realized_deals["Time"]).dt.normalize())
+        .groupby("Date")["NetPnl"]
+        .sum()
+        .sort_index()
+    )
+    business_days = pd.bdate_range(daily_pnl.index.min(), daily_pnl.index.max())
+    full_index = business_days.union(daily_pnl.index).sort_values()
+    daily_pnl = daily_pnl.reindex(full_index, fill_value=0.0)
+
+    return pd.DataFrame(
+        {
+            "Date": daily_pnl.index,
+            "NetPnl": daily_pnl.to_numpy(dtype=float),
+            "Return": daily_pnl.to_numpy(dtype=float) / INITIAL_EQUITY,
+        }
+    )
 
 
 def format_timedelta(value: timedelta | None) -> str:
@@ -288,106 +407,145 @@ def max_drawdown_duration(drawdown_curve: pd.DataFrame) -> timedelta:
 
     curve = drawdown_curve.sort_values("Time").reset_index(drop=True)
     max_duration = timedelta(0)
-    drawdown_start: pd.Timestamp | None = None
+    peak_time = pd.to_datetime(curve.iloc[0]["Time"])
+    peak_equity = float(curve.iloc[0]["Equity"])
+    underwater = False
 
-    for _, row in curve.iterrows():
-        dd = float(row["Drawdown"])
+    for _, row in curve.iloc[1:].iterrows():
+        equity = float(row["Equity"])
         t = pd.to_datetime(row["Time"])
+        if equity + EPSILON >= peak_equity:
+            if underwater:
+                max_duration = max(max_duration, t - peak_time)
+                underwater = False
+            peak_equity = max(peak_equity, equity)
+            peak_time = t
+        else:
+            underwater = True
 
-        if dd > EPSILON and drawdown_start is None:
-            drawdown_start = t
-        elif dd <= EPSILON and drawdown_start is not None:
-            duration = t - drawdown_start
-            if duration > max_duration:
-                max_duration = duration
-            drawdown_start = None
-
-    if drawdown_start is not None:
-        duration = curve.iloc[-1]["Time"] - drawdown_start
-        if duration > max_duration:
-            max_duration = duration
+    if underwater:
+        max_duration = max(
+            max_duration,
+            pd.to_datetime(curve.iloc[-1]["Time"]) - peak_time,
+        )
 
     return max_duration
 
 
 def compute_risk_metrics(
-    summary_metrics: dict[str, Any],
     realized_deals: pd.DataFrame,
     drawdown_curve: pd.DataFrame,
+    daily_returns: pd.DataFrame | None = None,
+    total_costs: float = 0.0,
 ) -> dict[str, Any]:
+    daily = daily_returns if daily_returns is not None else build_daily_returns(realized_deals)
     if realized_deals.empty:
-        total_trades = summary_metrics.get("Total Trades")
-        net_profit = summary_metrics.get("Total Net Profit")
-        expected_payoff = summary_metrics.get("Expected Payoff")
-        expectancy = expected_payoff
-        if expectancy is None and total_trades and net_profit is not None:
-            expectancy = float(net_profit) / float(total_trades)
         return {
-            "Win Rate": summary_metrics.get("Profit Trades Percent"),
+            "Total Net Profit": 0.0,
+            "Gross Profit": 0.0,
+            "Gross Loss": 0.0,
+            "Costs / Swap": total_costs,
+            "Profit Factor": None,
+            "Total Trades": 0,
+            "Win Rate": None,
             "Sharpe Ratio": None,
             "Sortino Ratio": None,
             "Time to Recovery": format_timedelta(timedelta(0)),
             "Time to Recovery Days": 0.0,
             "Largest Single Loss": 0.0,
+            "Balance Drawdown Maximal Value": 0.0,
+            "Max Drawdown (%)": 0.0,
+            "Recovery Factor": None,
+            "Calmar Ratio": None,
             "Net Profit / Max DD": None,
-            "Expectancy per Trade": expectancy,
+            "Expectancy per Trade": None,
+            "Average Trade": None,
+            "Average Win": None,
+            "Average Loss": None,
+            "Best Trade": None,
+            "Worst Trade": None,
+            "Best Day": None,
+            "Worst Day": None,
+            "Return on $100k": 0.0,
+            "Annualized Return": None,
         }
 
-    profit_col = "NetPnl" if "NetPnl" in realized_deals.columns else "Profit"
-    profits = realized_deals[profit_col].astype(float)
+    profits = realized_deals["NetPnl"].astype(float)
     trade_count = len(profits)
-    winning_trades = int((profits > 0).sum())
-    computed_win_rate = (winning_trades / trade_count) * 100 if trade_count > 0 else None
-    net_profit_computed = float(profits.sum())
-    largest_single_loss = float(profits.min())
+    wins = profits[profits > EPSILON]
+    losses = profits[profits < -EPSILON]
+    net_profit = float(profits.sum())
+    gross_profit = float(wins.sum())
+    gross_loss = float(losses.sum())
+    win_rate = (len(wins) / trade_count) * 100.0 if trade_count else None
+    profit_factor = gross_profit / abs(gross_loss) if gross_loss < -EPSILON else None
+    expectancy = net_profit / trade_count if trade_count else None
 
-    total_trades = summary_metrics.get("Total Trades")
-    net_profit_summary = summary_metrics.get("Total Net Profit")
-    expected_payoff = summary_metrics.get("Expected Payoff")
-    net_profit = float(net_profit_summary) if net_profit_summary is not None else net_profit_computed
-
-    expectancy = expected_payoff
-    if expectancy is None:
-        if total_trades and net_profit_summary is not None:
-            expectancy = float(net_profit_summary) / float(total_trades)
-        else:
-            expectancy = net_profit / trade_count if trade_count > 0 else 0.0
-
-    win_rate = summary_metrics.get("Profit Trades Percent")
-    if win_rate is None:
-        win_rate = computed_win_rate
-
-    prior_equity = INITIAL_EQUITY + profits.cumsum().shift(fill_value=0.0)
-    prior_equity = prior_equity.replace(0.0, INITIAL_EQUITY)
-    returns = profits / prior_equity
-
+    returns = daily["Return"].astype(float) if not daily.empty else pd.Series(dtype=float)
     mean_ret = float(returns.mean()) if not returns.empty else 0.0
     std_ret = float(returns.std(ddof=1)) if len(returns) > 1 else 0.0
-    sharpe_computed = (mean_ret / std_ret) * (len(returns) ** 0.5) if std_ret > EPSILON else None
+    sharpe = (
+        (mean_ret / std_ret) * (TRADING_DAYS_PER_YEAR**0.5)
+        if std_ret > EPSILON
+        else None
+    )
+    downside_returns = returns.clip(upper=0.0)
+    downside_deviation = (
+        float((downside_returns.pow(2).mean()) ** 0.5)
+        if not downside_returns.empty
+        else 0.0
+    )
+    sortino = (
+        (mean_ret / downside_deviation) * (TRADING_DAYS_PER_YEAR**0.5)
+        if downside_deviation > EPSILON
+        else None
+    )
+    annualized_return = mean_ret * TRADING_DAYS_PER_YEAR if not returns.empty else None
 
-    downside = returns[returns < 0.0]
-    downside_std = float(downside.std(ddof=1)) if len(downside) > 1 else 0.0
-    sortino = (mean_ret / downside_std) * (len(returns) ** 0.5) if downside_std > EPSILON else None
-
-    max_dd = summary_metrics.get("Balance Drawdown Maximal Value")
-    if max_dd is None:
-        max_dd = float(drawdown_curve["Drawdown"].max()) if not drawdown_curve.empty else 0.0
-    net_profit_over_dd = (net_profit / max_dd) if max_dd > EPSILON else None
+    max_dd = float(drawdown_curve["Drawdown"].max()) if not drawdown_curve.empty else 0.0
+    max_dd_pct = (
+        float((drawdown_curve["Drawdown"] / drawdown_curve["Peak"]).max())
+        if not drawdown_curve.empty
+        else 0.0
+    )
+    recovery_factor = net_profit / max_dd if max_dd > EPSILON else None
+    calmar = (
+        annualized_return / max_dd_pct
+        if annualized_return is not None and max_dd_pct > EPSILON
+        else None
+    )
     recovery_duration = max_drawdown_duration(drawdown_curve)
-
-    sharpe = summary_metrics.get("Sharpe Ratio")
-    if sharpe is None:
-        sharpe = sharpe_computed
+    daily_pnl = daily["NetPnl"].astype(float) if not daily.empty else pd.Series(dtype=float)
+    trading_day_pnl = daily_pnl[daily_pnl.abs() > EPSILON]
 
     return {
+        "Total Net Profit": net_profit,
+        "Gross Profit": gross_profit,
+        "Gross Loss": gross_loss,
+        "Costs / Swap": total_costs,
+        "Profit Factor": profit_factor,
+        "Total Trades": trade_count,
         "Win Rate": win_rate,
         "Sharpe Ratio": sharpe,
         "Sortino Ratio": sortino,
         "Time to Recovery": format_timedelta(recovery_duration),
         "Time to Recovery Days": timedelta_to_days(recovery_duration),
-        "Largest Single Loss": largest_single_loss,
-        "Net Profit / Max DD": net_profit_over_dd,
+        "Largest Single Loss": float(losses.min()) if not losses.empty else 0.0,
+        "Balance Drawdown Maximal Value": max_dd,
+        "Max Drawdown (%)": max_dd_pct,
+        "Recovery Factor": recovery_factor,
+        "Calmar Ratio": calmar,
+        "Net Profit / Max DD": recovery_factor,
         "Expectancy per Trade": expectancy,
+        "Average Trade": expectancy,
+        "Average Win": float(wins.mean()) if not wins.empty else None,
+        "Average Loss": float(losses.mean()) if not losses.empty else None,
+        "Best Trade": float(profits.max()),
+        "Worst Trade": float(profits.min()),
+        "Best Day": float(trading_day_pnl.max()) if not trading_day_pnl.empty else None,
+        "Worst Day": float(trading_day_pnl.min()) if not trading_day_pnl.empty else None,
+        "Return on $100k": net_profit / INITIAL_EQUITY,
+        "Annualized Return": annualized_return,
     }
 
 
@@ -435,19 +593,31 @@ def parse_report(uploaded_file) -> dict[str, Any]:
     workbook = load_workbook(BytesIO(uploaded_file.getvalue()), data_only=True, read_only=False)
     ws = workbook[workbook.sheetnames[0]]
 
-    metrics = extract_summary_metrics(ws)
+    reported_metrics = extract_summary_metrics(ws)
     deals = extract_deals_dataframe(ws)
     realized_deals = extract_realized_deals(deals)
     equity = build_equity_curve(deals)
     drawdown = build_drawdown_curve(equity)
-    metrics.update(compute_risk_metrics(metrics, realized_deals, drawdown))
+    daily_returns = build_daily_returns(realized_deals)
+    trade_deals = deals[~deals["Type"].isin({"balance", "credit"})]
+    total_costs = float(
+        trade_deals[["Commission", "Fee", "Swap"]].sum().sum()
+    )
+    metrics = compute_risk_metrics(
+        realized_deals,
+        drawdown,
+        daily_returns,
+        total_costs=total_costs,
+    )
 
     workbook.close()
     return {
         "name": uploaded_file.name,
         "metrics": metrics,
+        "reported_metrics": reported_metrics,
         "deals": deals,
         "realized_deals": realized_deals,
+        "daily_returns": daily_returns,
         "equity": equity,
         "drawdown": drawdown,
     }
@@ -466,23 +636,46 @@ def build_display_summary_table(summary_df: pd.DataFrame) -> pd.DataFrame:
     preferred_order = [
         "Report",
         "Total Net Profit",
+        "Gross Profit",
+        "Gross Loss",
+        "Costs / Swap",
         "Balance Drawdown Maximal Value",
+        "Max Drawdown (%)",
+        "Return on $100k",
+        "Annualized Return",
         "Win Rate",
         "Profit Factor",
         "Sharpe Ratio",
+        "Sortino Ratio",
+        "Calmar Ratio",
         "Time to Recovery",
         "Recovery Factor",
+        "Average Win",
+        "Average Loss",
+        "Best Trade",
+        "Best Day",
+        "Worst Day",
         "Expectancy per Trade",
         "Largest Single Loss",
-        "Sortino Ratio",
         "Total Trades",
     ]
     present_cols = [c for c in preferred_order if c in summary_df.columns]
     display_summary = summary_df[present_cols].copy()
-    if "Balance Drawdown Maximal Value" in display_summary.columns:
-        display_summary = display_summary.rename(
-            columns={"Balance Drawdown Maximal Value": "Max Drawdown ($)"}
-        )
+    for percentage_col in [
+        "Max Drawdown (%)",
+        "Return on $100k",
+        "Annualized Return",
+    ]:
+        if percentage_col in display_summary.columns:
+            display_summary[percentage_col] *= 100.0
+    display_summary = display_summary.rename(
+        columns={
+            "Balance Drawdown Maximal Value": "Max Drawdown ($)",
+            "Return on $100k": "Return on $100k (%)",
+            "Annualized Return": "Annualized Return (%)",
+            "Win Rate": "Win Rate (%)",
+        }
+    )
     return display_summary
 
 
@@ -501,7 +694,8 @@ def build_equity_overlay_table(reports: list[dict[str, Any]]) -> pd.DataFrame:
         return pd.DataFrame(columns=["Time"])
 
     merged = merged.sort_values("Time")
-    merged = merged.ffill()
+    report_columns = [column for column in merged.columns if column != "Time"]
+    merged[report_columns] = merged[report_columns].ffill().fillna(INITIAL_EQUITY)
     return merged
 
 
@@ -521,16 +715,34 @@ def make_download_workbook(reports: list[dict[str, Any]]) -> bytes:
     equity_overlay = build_equity_overlay_table(reports)
 
     all_deals = []
+    all_realized = []
+    all_daily_returns = []
     for report in reports:
         deals = report["deals"].copy()
         deals.insert(0, "Report", report["name"])
         all_deals.append(deals)
+        realized = report["realized_deals"].copy()
+        realized.insert(0, "Report", report["name"])
+        all_realized.append(realized)
+        daily_returns = report["daily_returns"].copy()
+        daily_returns.insert(0, "Report", report["name"])
+        all_daily_returns.append(daily_returns)
     deals_df = pd.concat(all_deals, ignore_index=True) if all_deals else pd.DataFrame()
+    realized_df = (
+        pd.concat(all_realized, ignore_index=True) if all_realized else pd.DataFrame()
+    )
+    daily_returns_df = (
+        pd.concat(all_daily_returns, ignore_index=True)
+        if all_daily_returns
+        else pd.DataFrame()
+    )
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="yyyy-mm-dd hh:mm:ss") as writer:
         display_summary.to_excel(writer, sheet_name="Summary", index=False)
         equity_overlay.to_excel(writer, sheet_name="Equity Overlay", index=False)
+        realized_df.to_excel(writer, sheet_name="Closed Trades", index=False)
+        daily_returns_df.to_excel(writer, sheet_name="Daily Returns", index=False)
         deals_df.to_excel(writer, sheet_name="Deals", index=False)
 
         workbook = writer.book
@@ -545,17 +757,42 @@ def make_download_workbook(reports: list[dict[str, Any]]) -> bytes:
             "Max Drawdown ($)",
             "Largest Single Loss",
             "Expectancy per Trade",
+            "Gross Profit",
+            "Gross Loss",
+            "Average Win",
+            "Average Loss",
+            "Best Trade",
+            "Worst Trade",
+            "Best Day",
+            "Worst Day",
         ]:
             if col_name in display_summary.columns:
                 col_idx = display_summary.columns.get_loc(col_name)
                 summary_sheet.set_column(col_idx, col_idx, 22, currency_fmt)
 
-        for col_name in ["Win Rate", "Sharpe Ratio", "Sortino Ratio"]:
+        for col_name in [
+            "Profit Factor",
+            "Sharpe Ratio",
+            "Sortino Ratio",
+            "Calmar Ratio",
+            "Recovery Factor",
+        ]:
             if col_name in display_summary.columns:
                 col_idx = display_summary.columns.get_loc(col_name)
                 summary_sheet.set_column(col_idx, col_idx, 16, ratio_fmt)
 
-        if "Time to Recovery" in summary_df.columns:
+        percentage_fmt = workbook.add_format({"num_format": '0.00"%"'})
+        for col_name in [
+            "Win Rate (%)",
+            "Max Drawdown (%)",
+            "Return on $100k (%)",
+            "Annualized Return (%)",
+        ]:
+            if col_name in display_summary.columns:
+                col_idx = display_summary.columns.get_loc(col_name)
+                summary_sheet.set_column(col_idx, col_idx, 18, percentage_fmt)
+
+        if "Time to Recovery" in display_summary.columns:
             col_idx = display_summary.columns.get_loc("Time to Recovery")
             summary_sheet.set_column(col_idx, col_idx, 16)
 
@@ -671,40 +908,32 @@ def render_dashboard(reports: list[dict[str, Any]]) -> None:
         )
         st.plotly_chart(fig_profit_dd, use_container_width=True)
 
-    # 4, 5, 6. Trade quality and risk-adjusted strength in one normalized score view.
+    # 4, 5, 6. Show the actual values; normalizing ratios against the batch can
+    # hide negative Sharpe values and is not a valid performance calculation.
     quality_cols = [c for c in ["Win Rate", "Profit Factor", "Sharpe Ratio"] if c in summary_df.columns]
     if quality_cols:
         st.subheader("Trade Quality and Risk-Adjusted Performance")
         st.caption(
-            "Each metric is shown as a percent of the best report in this upload batch (best = 100). "
-            "This is for relative comparison only, not an absolute score."
+            "Raw calculated values are shown on independent axes so unlike metrics "
+            "are not converted into a synthetic score."
         )
         quality_df = summary_df[["Report", *quality_cols]].copy()
-        normalized = quality_df.set_index("Report")
-        normalized = normalized.apply(pd.to_numeric, errors="coerce")
-        normalized = normalized.fillna(normalized.median(numeric_only=True)).fillna(0.0)
-        for col in quality_cols:
-            col_max = normalized[col].max()
-            if pd.notna(col_max) and col_max > EPSILON:
-                normalized[col] = (normalized[col] / col_max) * 100.0
-            else:
-                normalized[col] = 0.0
-        normalized = normalized.reset_index().melt(
+        quality_melted = quality_df.melt(
             id_vars=["Report"],
             value_vars=quality_cols,
             var_name="Metric",
-            value_name="Score vs Best (%)",
+            value_name="Value",
         )
         fig_quality = px.bar(
-            normalized,
+            quality_melted,
             x="Report",
-            y="Score vs Best (%)",
-            color="Metric",
-            barmode="group",
-            title="Relative Quality Profile (Best-In-Set = 100)",
-            labels={"Score vs Best (%)": "% of Best"},
+            y="Value",
+            facet_col="Metric",
+            facet_col_wrap=3,
+            title="Trade Quality Metrics (Raw Values)",
         )
-        fig_quality.update_yaxes(range=[0, 105])
+        fig_quality.update_yaxes(matches=None)
+        fig_quality.for_each_annotation(lambda annotation: annotation.update(text=annotation.text.split("=")[-1]))
         st.plotly_chart(fig_quality, use_container_width=True)
 
     # 7. Time to recovery shown as days/hours labels and numeric day bars.
@@ -749,9 +978,13 @@ def render_dashboard(reports: list[dict[str, Any]]) -> None:
             sec_melted,
             x="Report",
             y="Value",
-            color="Metric",
-            barmode="group",
+            facet_col="Metric",
+            facet_col_wrap=2,
             title="Efficiency, Expectancy, and Tail-Risk Metrics",
+        )
+        fig_secondary.update_yaxes(matches=None)
+        fig_secondary.for_each_annotation(
+            lambda annotation: annotation.update(text=annotation.text.split("=")[-1])
         )
         st.plotly_chart(fig_secondary, use_container_width=True)
 
